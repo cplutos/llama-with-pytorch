@@ -1,23 +1,24 @@
+import json
+import math
+import time
 from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import math
-from typing import Optional
-
-from sympy.matrices.expressions.transpose import transpose
-
+from sentencepiece import SentencePieceProcessor
 
 @dataclass
 class ModelArgs:
     dim: int = 4096
-    n_layers: int = 32 # transformer block 堆叠数量
-    n_heads: int = 32 # heads 中 Q 的数量，回顾MQA GQA
-    n_kv_heads: Optional[int] = None # heads 中 K 和 V 的数量
-    vocab_size: int = -1 # 这个值在加载分词器设置
-    multiple_of: int = 256 # FFN 网络中隐藏神经元数量
-    ffn_dim_multiplier: Optional[float] = None # 当使用GQA之后，K和V的数量会减少，但是增加FFN中的神经元数量
+    n_layers: int = 32  # transformer block 堆叠数量
+    n_heads: int = 32  # heads 中 Q 的数量，回顾MQA GQA
+    n_kv_heads: Optional[int] = None  # heads 中 K 和 V 的数量
+    vocab_size: int = -1  # 这个值在加载分词器设置
+    multiple_of: int = 256  # FFN 网络中隐藏神经元数量
+    ffn_dim_multiplier: Optional[float] = None  # 当使用GQA之后，K和V的数量会减少，但是增加FFN中的神经元数量
     norm_eps: float = 1e-5
 
     # 参数给 KV cache 所用
@@ -26,14 +27,15 @@ class ModelArgs:
 
     device: str = None
 
+
 def precompute_theta_pos_frequencies(head_dim: int, seq_len: int, device: str, theta: float = 10000.0):
     # 预先计算Rope中需要的mθ
     assert head_dim % 2 == 0, "必须可以被2整除，因为公式中 d/2"
 
     # 构建theta 参数
     # 根据论文中的公式实现
-    theta_numerator = torch.arange(0, head_dim, 2).float() # 2(i - 1 )
-    theta = 1.0 / (theta ** (theta_numerator / head_dim))   # 10000^(-2(i-1)/d)
+    theta_numerator = torch.arange(0, head_dim, 2).float()  # 2(i - 1 )
+    theta = 1.0 / (theta ** (theta_numerator / head_dim))  # 10000^(-2(i-1)/d)
 
     # 构建m参数，代表着position位置
     m = torch.arange(seq_len, device=device)
@@ -45,6 +47,7 @@ def precompute_theta_pos_frequencies(head_dim: int, seq_len: int, device: str, t
     # 我们可以用极坐标形式计算复数
     freqs_complex = torch.polar(torch.ones_like(freqs), freqs)
     return freqs_complex
+
 
 def apply_rotary_embedding(x: torch.Tensor, freqs_complex: torch.Tensor, device: str):
     # 1. 将x token向量中的dimension个值分组， 2个值为一组
@@ -60,6 +63,7 @@ def apply_rotary_embedding(x: torch.Tensor, freqs_complex: torch.Tensor, device:
     x_out = torch.view_as_real(x_rotated)
     x_out = x_out.reshape(*x.shape)
     return x_out.type_as(x).to(device)
+
 
 class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
@@ -77,7 +81,8 @@ class RMSNorm(nn.Module):
     def forward(self, x: torch.Tensor):
         return self._norm(x.floor()).type_as(x) * self.weight
 
-def repeat_kv(x: torch.Tensor, n_rep: int)-> torch.Tensor:
+
+def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     batch_size, seq_len, n_kv_heads, head_dim = x.shape
     if n_rep == 1:
         # MHA
@@ -112,7 +117,7 @@ class SelfAttention(nn.Module):
 
     def forward(self, x: torch.Tensor, start_pos: int, freqs_complex: torch.Tensor):
         # (B, 1, Dim)
-        batch_size, seq_len , _ = x.shape
+        batch_size, seq_len, _ = x.shape
 
         # (B, 1, Dim) -> (B, 1, H_Q * Head_Dim)
         xq = self.wq(x)
@@ -132,12 +137,12 @@ class SelfAttention(nn.Module):
         xk = apply_rotary_embedding(xk, freqs_complex, device=x.device)
 
         # 因为前面把 cache 全部初始化为 0 ，所以这里"append"其实就是将对应信息赋值
-        self.cache_k[:batch_size, start_pos:start_pos+seq_len] = xk
-        self.cache_v[:batch_size, start_pos:start_pos+seq_len] = xv
+        self.cache_k[:batch_size, start_pos:start_pos + seq_len] = xk
+        self.cache_v[:batch_size, start_pos:start_pos + seq_len] = xv
 
         # 为了后面去计算self attention
-        keys = self.cache_k[:batch_size, 0:start_pos+seq_len]
-        values = self.cache_v[:batch_size, 0:start_pos+seq_len]
+        keys = self.cache_k[:batch_size, 0:start_pos + seq_len]
+        values = self.cache_v[:batch_size, 0:start_pos + seq_len]
 
         # 重复 keys and values 以达到 queries 的数量
         keys = repeat_kv(keys, self.n_req)
@@ -158,7 +163,8 @@ class SelfAttention(nn.Module):
         # contiguous()方法用于解决运行时出现错误：RuntimeError: Input is not contiguous
         output.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
 
-        return self.wo(output) # (B, 1, Dim)
+        return self.wo(output)  # (B, 1, Dim)
+
 
 class FeedForward(nn.Module):
     def __init__(self, args: ModelArgs):
@@ -171,7 +177,7 @@ class FeedForward(nn.Module):
 
         # hidden_size = 7；multiple = 5；现在是7但是想要比7大的第一个五的倍数
         # (7 + 5 - 1) // 5 = 2 --> 5 * 2 = 10
-        hidden_dim = args.multiple_of * ((hidden_dim + args.multiple_of -1) // args.multiple_of)
+        hidden_dim = args.multiple_of * ((hidden_dim + args.multiple_of - 1) // args.multiple_of)
 
         self.w1 = nn.Linear(args.dim, hidden_dim, bias=False)
         self.w2 = nn.Linear(hidden_dim, args.dim, bias=False)
@@ -187,7 +193,6 @@ class FeedForward(nn.Module):
         # 降维
         x = self.w2(x)
         return x
-
 
 
 class EncoderBlock(nn.Module):
@@ -212,11 +217,12 @@ class EncoderBlock(nn.Module):
         out = h + self.feed_forward.forward(self.ffn_norm(h))
         return out
 
+
 class Transformer(nn.Module):
     def __init__(self, args: ModelArgs) -> None:
         super().__init__()
 
-        assert  args.vocab_size != -1, "必须设定词大小"
+        assert args.vocab_size != -1, "必须设定词大小"
 
         self.args = args
         self.vocab_size = args.vocab_size
@@ -251,8 +257,52 @@ class Transformer(nn.Module):
 
         # 连续应用encoder layers / transformer block
         for layer in self.layers:
-            h = layer(h,start_pos, freqs_complex)
+            h = layer(h, start_pos, freqs_complex)
 
         h = self.norm(h)
         output = self.output(h).float()
         return output
+
+class LLaMA:
+    def __init__(self, model: Transformer, tokenizer: SentencePieceProcessor, model_args: ModelArgs):
+        self.model = model
+        self.tokenizer = tokenizer
+        self.args = model_args
+
+    @staticmethod
+    def build(checkpoints_dir: str, tokenizer_path: str, load_model: bool, max_seq_len: int , max_batch_size: int,
+              device: str):
+        prev_time = time.time()
+        if load_model:
+            checkpoints = sorted(Path(checkpoints_dir).glob("*.pth"))
+            assert  len(checkpoints) > 0, f"checkpoint 文件没有在{checkpoints_dir}找到"
+            chk_path = checkpoints[0]
+            print(f'加载模型文件...{chk_path}')
+            checkpoint = torch.load(chk_path, map_location='cpu')
+            print(f'模型文件加载完成，耗时{time.time() - prev_time:.2f}秒')
+            prev_time = time.time()
+
+        if device == "cuda":
+            torch.set_default_tensor_type(torch.cuda.HalfTensor)
+        else:
+            torch.set_default_tensor_type(torch.BFloat16Tensor)
+
+        with open(Path(checkpoints_dir) / "params.json", "r") as f:
+            params = json.loads(f.read())
+
+        model_args: ModelArgs = ModelArgs(
+            max_seq_len=max_seq_len,
+            max_batch_size=max_batch_size,
+            device=device,
+            **params
+        )
+        tokenizer = SentencePieceProcessor()
+        tokenizer.load(tokenizer_path)
+        model_args.vocab_size = tokenizer.vocab_size()
+
+        model = Transformer(model_args).to(device)
+
+        if load_model:
+            # 从checkpoints中删除repo.freqs, 因为我们前面通过precompute_theta_pos_frequencies计算了
+            del checkpoint["repo.freqs"]
+            model.load_state_dict(checkpoint)
